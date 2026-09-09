@@ -9,6 +9,7 @@
 #include <iostream>
 #include <memory>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -80,6 +81,7 @@ struct Connection {
 
 struct Server {
   std::string server_ip;
+  sockaddr_in addr{};
   int active_connect = 0;
   int error_count = 0;
   bool active_server = true;

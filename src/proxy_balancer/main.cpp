@@ -30,7 +30,25 @@
 #define PORT "8080"
 
 using namespace std;
+bool init_server_addresses() {
+  for (auto &s : server_list) {
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
 
+    int err = getaddrinfo(s.server_ip.c_str(), "3491", &hints, &res);
+    if (err != 0 || !res) {
+      std::cerr << "Критическая ошибка резолва " << s.server_ip << ": "
+                << gai_strerror(err) << std::endl;
+      return false;
+    }
+
+    // Копируем бинарный адрес прямо в структуру сервера
+    std::memcpy(&s.addr, res->ai_addr, sizeof(sockaddr_in));
+    freeaddrinfo(res);
+  }
+  return true;
+}
 optional<Socket> create_tcp_upstream() {
   optional<TCPserver> upstream;
   while (true) {
@@ -41,10 +59,16 @@ optional<Socket> create_tcp_upstream() {
       cout << "Доступных серверов нет" << endl;
       return nullopt;
     }
-    upstream = TCPserver::create_tcp(it->server_ip.c_str(), "3491",
-                                     SocketMode::Connector, true);
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
+      return nullopt;
+    }
+    Socket upstream_sock(fd);
+    // it->addr уже лежит в памяти, никакой задержки:
+    int res = connect(fd, reinterpret_cast<struct sockaddr *>(&it->addr),
+                      sizeof(it->addr));
 
-    if (!upstream) {
+    if (res < 0 && errno != EINPROGRESS) {
       cerr << "Не удалось создать tcp upstream";
       it->error_count++;
       if (it->error_count >= 2) {
@@ -54,11 +78,10 @@ optional<Socket> create_tcp_upstream() {
       }
       continue;
     }
+    return upstream_sock;
     it->active_connect++;
     break;
   }
-
-  return upstream->get_socket();
 }
 
 class Timer {
@@ -117,6 +140,8 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
       }
 
       if (conn == &timer_conn) {
+        uint64_t expirations = 0;
+        read(conn->socket.get(), &expirations, sizeof(expirations));
         auto inactive_server =
             server_list |
             std::views::filter([](const auto &s) { return !s.active_server; });
@@ -124,10 +149,10 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
           if (auto upstream = TCPserver::create_tcp(
                   s.server_ip.c_str(), "3491", SocketMode::Connector, true)) {
             s.active_server = true;
+            s.error_count = 0;
           }
         }
-        uint64_t expirations = 0;
-        read(conn->socket.get(), &expirations, sizeof(expirations));
+
         continue;
       }
 
@@ -146,6 +171,10 @@ void eventloop(TCPserver &server, EpollManage &epoll) {
 
           auto upstream = create_tcp_upstream();
           if (!upstream) {
+            std::string err_resp =
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: "
+                "0\r\nConnection: close\r\n\r\n";
+            send(client.get(), err_resp.data(), err_resp.size(), 0);
             break;
           }
           cout << "upstream " << upstream->get() << endl;
