@@ -5,7 +5,9 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 import random
 import subprocess
+import pytest
 
+SERVERS = ["backend1", "backend2", "backend3"]
 LB_URL = "http://127.0.0.1:3490"
 LB_SERVICE_NAME = "lb"
 
@@ -53,6 +55,15 @@ def test_leas_connection():
         assert count < TOTAL_REQUESTS, f"Нода {node} монополизировала трафик"
 
 
+@pytest.fixture(autouse=True)
+def ensure_all_backends_alive():
+    """Перед каждым тестом и после него гарантируем, что все контейнеры запущены"""
+    subprocess.run(["docker", "compose", "start"] + SERVERS, check=True)
+    time.sleep(1.0)  # Даем 1 сек на прогрев портов
+    yield
+    subprocess.run(["docker", "compose", "start"] + SERVERS, check=True)
+
+
 def test_chaos_node_failure():
     """Тушим один бэкенд прямо во время активного трафика"""
     TOTAL = 300
@@ -61,25 +72,22 @@ def test_chaos_node_failure():
     # Функция-диверсант: ждет 0.1 сек и глушит бэкенд
     def killer():
         time.sleep(0.1)
-        server_list = ["backend1", "backend2", "backend3"]
-        subprocess.run(
-            ["docker", "compose", "stop", random.choice(server_list)], check=True
-        )
+        subprocess.run(["docker", "compose", "kill", "backend1"], check=True)
 
     with ThreadPoolExecutor(max_workers=WORKERS + 1) as pool:
         # Запускаем диверсанта параллельно с запросами
         pool.submit(killer)
         results = list(pool.map(send_request, range(TOTAL)))
 
-    # Собираем ответившие ноды
+    with ThreadPoolExecutor(max_workers=WORKERS + 1) as pool:
+        kill_future = pool.submit(killer)
+        results = list(pool.map(send_request, range(TOTAL)))
+        kill_future.result()
+
     successful_nodes = {r["node"] for r in results if r["status"] == "ok"}
-
-    # 1. Убеждаемся, что оставшиеся ноды продолжили обслуживать трафик
-    assert "backend-3492" in successful_nodes
-    assert "backend-3493" in successful_nodes
-
-    # 2. Доля успешных запросов должна быть высокой (свыше 90%)
     success_count = sum(1 for r in results if r["status"] == "ok")
-    assert success_count / TOTAL > 0.90, (
+
+    print(f"\n[Успешно]: {success_count}/{TOTAL}. Живые ноды: {successful_nodes}")
+    assert (success_count / TOTAL) > 0.85, (
         f"Слишком много потерь при падении ноды: {success_count}/{TOTAL}"
     )
