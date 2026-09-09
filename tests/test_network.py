@@ -41,35 +41,32 @@ def test_leas_connection():
         results = list(executor.map(fetch_node_id, range(TOTAL_REQUESTS)))
 
     errors = [r for r in results if r.startswith("ERROR")]
-    assert len(errors) == 0, f"Были сетевые ошибки: {errors}"
+    assert len(errors) == 0, f"There were network errors: {errors}"
 
     node_counts = {}
     for node in results:
         node_counts[node] = node_counts.get(node, 0) + 1
 
-    print(f"\n[Распределение нагрузки]: {node_counts}")
+    print(f"\nLoad distribution: {node_counts}")
 
-    assert len(node_counts) >= 2, f"Все запросы ушли в одну ноду: {node_counts}"
+    assert len(node_counts) >= 2, f"All requests went to one node: {node_counts}"
 
     for node, count in node_counts.items():
-        assert count < TOTAL_REQUESTS, f"Нода {node} монополизировала трафик"
+        assert count < TOTAL_REQUESTS, f"Node {node} monopolized traffic"
 
 
 @pytest.fixture(autouse=True)
 def ensure_all_backends_alive():
-    """Перед каждым тестом и после него гарантируем, что все контейнеры запущены"""
     subprocess.run(["docker", "compose", "start"] + SERVERS, check=True)
-    time.sleep(1.0)  # Даем 1 сек на прогрев портов
+    time.sleep(1.0) 
     yield
     subprocess.run(["docker", "compose", "start"] + SERVERS, check=True)
 
 
 def test_chaos_node_failure():
-    """Тушим один бэкенд прямо во время активного трафика"""
     TOTAL = 300
     WORKERS = 15
 
-    # Функция-диверсант: ждет 0.1 сек и глушит бэкенд
     def killer():
         time.sleep(0.1)
         subprocess.run(["docker", "compose", "kill", "backend1"], check=True)
@@ -82,7 +79,7 @@ def test_chaos_node_failure():
     successful_nodes = {r["node"] for r in results if r["status"] == "ok"}
     success_count = sum(1 for r in results if r["status"] == "ok")
 
-    print(f"\n[Успешно]: {success_count}/{TOTAL}. Живые ноды: {successful_nodes}")
+    print(f"\Successfully: {success_count}/{TOTAL}. Live nodes: {successful_nodes}")
     assert (success_count / TOTAL) > 0.85, (
-        f"Слишком много потерь при падении ноды: {success_count}/{TOTAL}"
+        f"Too many losses when a node crashes: {success_count}/{TOTAL}"
     )
