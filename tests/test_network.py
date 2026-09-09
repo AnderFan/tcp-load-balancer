@@ -19,8 +19,8 @@ def fetch_node_id(_):
 
 
 def test_leas_connection():
-    TOTAL_REQUESTS = 50
-    CONCURENT_WORKERS = 15
+    TOTAL_REQUESTS = 1000
+    CONCURENT_WORKERS = 50
 
     with ThreadPoolExecutor(max_workers=CONCURENT_WORKERS) as executor:
         results = list(executor.map(fetch_node_id, range(TOTAL_REQUESTS)))
