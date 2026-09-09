@@ -58,7 +58,7 @@ def test_leas_connection():
 @pytest.fixture(autouse=True)
 def ensure_all_backends_alive():
     subprocess.run(["docker", "compose", "start"] + SERVERS, check=True)
-    time.sleep(1.0) 
+    time.sleep(1.0)
     yield
     subprocess.run(["docker", "compose", "start"] + SERVERS, check=True)
 
@@ -79,7 +79,7 @@ def test_chaos_node_failure():
     successful_nodes = {r["node"] for r in results if r["status"] == "ok"}
     success_count = sum(1 for r in results if r["status"] == "ok")
 
-    print(f"\Successfully: {success_count}/{TOTAL}. Live nodes: {successful_nodes}")
+    print(f"\nSuccessfully: {success_count}/{TOTAL}. Live nodes: {successful_nodes}")
     assert (success_count / TOTAL) > 0.85, (
         f"Too many losses when a node crashes: {success_count}/{TOTAL}"
     )

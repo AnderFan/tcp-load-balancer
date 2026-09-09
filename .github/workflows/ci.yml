@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++-13 python3-pytest python3-requests
+          sudo apt-get install -y cmake ninja-build g++-13 python3-pytest python3-requests python3-docker
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 --slave /usr/bin/g++ g++ /usr/bin/g++-13
 
       - name: Configure CMake
