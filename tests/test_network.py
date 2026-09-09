@@ -34,8 +34,8 @@ def send_request(_):
 
 
 def test_leas_connection():
-    TOTAL_REQUESTS = 100
-    CONCURENT_WORKERS = 10
+    TOTAL_REQUESTS = 10000
+    CONCURENT_WORKERS = 100
 
     with ThreadPoolExecutor(max_workers=CONCURENT_WORKERS) as executor:
         results = list(executor.map(fetch_node_id, range(TOTAL_REQUESTS)))
@@ -73,11 +73,6 @@ def test_chaos_node_failure():
     def killer():
         time.sleep(0.1)
         subprocess.run(["docker", "compose", "kill", "backend1"], check=True)
-
-    with ThreadPoolExecutor(max_workers=WORKERS + 1) as pool:
-        # Запускаем диверсанта параллельно с запросами
-        pool.submit(killer)
-        results = list(pool.map(send_request, range(TOTAL)))
 
     with ThreadPoolExecutor(max_workers=WORKERS + 1) as pool:
         kill_future = pool.submit(killer)
