@@ -1,4 +1,3 @@
-# ─── ЭТАП 1: Сборка бинарника ────────────────────────────────────────────────
 FROM gcc:14-bookworm AS builder
 
 RUN apt-get update && apt-get install -y cmake ninja-build && rm -rf /var/lib/apt/lists/*
@@ -9,18 +8,15 @@ COPY CMakeLists.txt .
 COPY common/ ./common/
 COPY src/ ./src/
 
-# Собираем ТОЛЬКО таргет backend_server
 RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build --target backend_server
 
-# ─── ЭТАП 2: Минимальный образ для запуска ────────────────────────────────────
 FROM debian:bookworm-slim
 
 WORKDIR /app
 
 COPY --from=builder /build/build/backend_server /app/backend_server
 
-# Порт бэкенд-сервера
 EXPOSE 3491
 
 ENTRYPOINT ["/app/backend_server"]
