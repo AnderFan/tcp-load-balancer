@@ -5,9 +5,9 @@
 [![I/O](https://img.shields.io/badge/I%2FO-epoll%20ET-green.svg)](https://man7.org/linux/man-pages/man7/epoll.7.html)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A simple, TCP stream load balancer written in modern C++20. 
+A simple, TCP stream load balancer written in modern C++20.
 
-The goal of this project was to explore Linux systems programming concepts in practice: non-blocking sockets, `epoll` in edge-triggered mode.
+The goal of this project was to explore Linux systems programming concepts in practice: non-blocking sockets, `epoll` in edge-triggered mode
 ---
 
 ## Features & Implementation Details
@@ -71,7 +71,7 @@ Each connection pair transitions through three basic states:
 
 ---
 
-## Quick Start 
+## Quick Start
 
 The easiest way to test the project is using the included Docker Compose setup, which spins up the load balancer and 3 simple echo backends.
 
@@ -111,6 +111,7 @@ pytest tests/ -v
 ## Project Limitations & Future Ideas
 
 Since this is a learning project, there are deliberate simplifications:
+
 * **Single-threaded:** Runs on a single event loop. Could be scaled across multiple cores using `SO_REUSEPORT` with thread-per-core workers.
 * **Plain TCP Only:** Operates strictly at Layer 4; does not parse HTTP semantics, headers, or terminate TLS.
 * **Buffer Management:** Buffers use `std::string`. A zero-copy pipeline using `splice(2)` or circular ring buffers would further reduce memory copies.

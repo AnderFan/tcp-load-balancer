@@ -1,0 +1,15 @@
+build/
+bin/
+*.o
+*.a
+*.so
+.ninja_*
+CMakeCache.txt
+CMakeFiles/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+env/
+
