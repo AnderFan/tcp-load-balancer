@@ -1,4 +1,0 @@
-/home/anf/dev/cpp/cpp_teach/balancer/app/build/CMakeFiles/load_balancer.dir
-/home/anf/dev/cpp/cpp_teach/balancer/app/build/CMakeFiles/backend_server.dir
-/home/anf/dev/cpp/cpp_teach/balancer/app/build/CMakeFiles/edit_cache.dir
-/home/anf/dev/cpp/cpp_teach/balancer/app/build/CMakeFiles/rebuild_cache.dir

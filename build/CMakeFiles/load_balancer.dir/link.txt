@@ -1,1 +1,0 @@
-/usr/bin/c++ -static-libstdc++ -static-libgcc -Wl,--dependency-file=CMakeFiles/load_balancer.dir/link.d CMakeFiles/load_balancer.dir/src/proxy_balancer/main.cpp.o -o load_balancer

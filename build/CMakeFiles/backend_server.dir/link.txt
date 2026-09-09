@@ -1,1 +1,0 @@
-/usr/bin/c++ -static-libstdc++ -static-libgcc -Wl,--dependency-file=CMakeFiles/backend_server.dir/link.d CMakeFiles/backend_server.dir/src/backend/main.cpp.o -o backend_server
