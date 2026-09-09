@@ -72,13 +72,6 @@ enum class TcpRole { Client, Upstream, Listener };
 
 struct Session;
 
-struct Connection {
-  Socket socket;
-  Connection *peer;
-  std::string out_buffer;
-  bool close_on_empty = false;
-};
-
 struct Server {
   std::string server_ip;
   sockaddr_in addr{};
@@ -89,27 +82,76 @@ struct Server {
 
 inline std::vector<Server> server_list{
     {"backend1"}, {"backend2"}, {"backend3"}};
+enum class SlotType : uint8_t { UNUSED = 0, LISTENER, TIMER, CLIENT, UPSTREAM };
 
-struct Session {
-  Connection client;
-  Connection upstream;
-  Server ptr_server;
-  Session() {
-    client.peer = &upstream;
-    upstream.peer = &client;
+enum class ConnState : uint8_t { IDLE = 0, FORWARDING, DRAINING };
+
+struct ConnectionSlot {
+  ConnectionSlot() = default;
+  Socket socket;
+  uint32_t generation{0};
+  SlotType type{SlotType::UNUSED};
+  ConnState state{ConnState::IDLE};
+
+  ConnectionSlot *peer{nullptr};
+  Server *server{nullptr};
+
+  std::string out_buffer;
+};
+
+class ConectionPool {
+public:
+  struct Tunnel {
+    ConnectionSlot &client;
+    ConnectionSlot &upstream;
+  };
+  explicit ConectionPool(size_t max_fds) : pool_(max_fds) {}
+
+  Tunnel create_tunnel(Socket client, Socket upstream, Server *server) {
+    int client_fd = client.get();
+    int upstream_fd = upstream.get();
+
+    auto &cl_slot = get(client_fd);
+    auto &up_slot = get(upstream_fd);
+
+    cl_slot.socket = std::move(client);
+    cl_slot.type = SlotType::CLIENT;
+    cl_slot.state = ConnState::FORWARDING;
+    cl_slot.peer = &up_slot;
+
+    up_slot.socket = std::move(upstream);
+    up_slot.type = SlotType::UPSTREAM;
+    up_slot.state = ConnState::FORWARDING;
+    up_slot.peer = &cl_slot;
+    up_slot.server = server;
+
+    return {cl_slot, up_slot};
   }
+  ConnectionSlot &create_slot(Socket sock, SlotType type) {
+    int fd = sock.get();
+    auto &fd_slot = get(fd);
+
+    fd_slot.socket = std::move(sock);
+    fd_slot.type = type;
+    fd_slot.state = ConnState::FORWARDING;
+    return fd_slot;
+  }
+
+  [[nodiscard]] ConnectionSlot &get(int fd) noexcept { return pool_[fd]; }
+
+  [[nodiscard]] const ConnectionSlot &get(int fd) const noexcept {
+    return pool_[fd];
+  }
+
+  size_t capacity() const noexcept { return pool_.size(); }
+
+private:
+  std::vector<ConnectionSlot> pool_;
 };
 
 struct DataResult {
   Socket socket;
   Status status;
-};
-
-struct ClientSession {
-  Socket client;
-  Socket upstream;
-  std::string write_buffer;
-  std::string read_buffer;
 };
 
 enum class SocketMode { Listener, Connector };
@@ -170,13 +212,11 @@ public:
   Socket get_socket() { return std::move(listener_fd); }
 };
 
-struct Connection;
-
 class EpollManage {
 private:
   int epoll_fd = -1;
 
-  bool modify_epoll_event(Connection *client, uint32_t events, int op) {
+  bool modify_epoll_event(auto *client, uint32_t events, int op) {
     epoll_event ev{};
     ev.events = events | EPOLLET;
     ev.data.ptr = client;
@@ -212,19 +252,19 @@ public:
     return epoll_fd;
   }
 
-  bool epoll_add_write(Connection *client) {
+  bool epoll_add_write(auto *client) {
     return modify_epoll_event(client, EPOLLOUT, EPOLL_CTL_ADD);
   }
-  bool epoll_add_read(Connection *client) {
+  bool epoll_add_read(auto *client) {
     return modify_epoll_event(client, EPOLLIN, EPOLL_CTL_ADD);
   }
-  bool epoll_enable_write(Connection *client) {
+  bool epoll_enable_write(auto *client) {
     return modify_epoll_event(client, EPOLLIN | EPOLLOUT, EPOLL_CTL_MOD);
   }
-  bool epoll_disable_write(Connection *client) {
+  bool epoll_disable_write(auto *client) {
     return modify_epoll_event(client, EPOLLIN, EPOLL_CTL_MOD);
   }
-  bool epoll_remove(Connection *client) {
+  bool epoll_remove(auto *client) {
     return ::epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client->socket.get(),
                        nullptr) == 0;
   }
@@ -302,18 +342,3 @@ inline SendData parse_string(std::string str) {
   std::string result{text};
   return {result, fd};
 }
-
-// inline std::size_t sendall(int fd, const std::string &request,
-//                            std::size_t total_bytes) {
-//   auto bytes_left = request.size() - total_bytes;
-//   while (total_bytes < request.size()) {
-//     auto n =
-//         ::send(fd, request.c_str() + total_bytes, bytes_left,
-//         MSG_NOSIGNAL);
-//     if (n == -1)
-//       break;
-//     total_bytes += static_cast<std::size_t>(n);
-//     bytes_left -= static_cast<std::size_t>(n);
-//   }
-//   return bytes_left;
-// }

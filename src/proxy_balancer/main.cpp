@@ -8,10 +8,8 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
-#include <deque>
 #include <fcntl.h>
 #include <iostream>
-#include <memory>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <optional>
@@ -19,18 +17,21 @@
 #include <ranges>
 #include <string>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
+#include <system_error>
 #include <unistd.h>
-#include <unordered_map>
 #include <vector>
-
-#define CLIENT_PORT "3490"
 #define BACKEND_PORT "3491"
+#define CLIENT_PORT "3490"
 
-using namespace std;
+namespace {
+std::vector<Server> inactive_server;
+} // namespace
+
 bool init_server_addresses() {
   for (auto &s : server_list) {
     struct addrinfo hints{}, *res = nullptr;
@@ -39,22 +40,16 @@ bool init_server_addresses() {
 
     int err = getaddrinfo(s.server_ip.c_str(), "3491", &hints, &res);
     if (err != 0 || !res) {
-      std::cerr << "Критическая ошибка резолва " << s.server_ip << ": "
+      std::cerr << "Critical resolve error " << s.server_ip << ": "
                 << gai_strerror(err) << std::endl;
       return false;
     }
 
-    // Копируем бинарный адрес прямо в структуру сервера
     std::memcpy(&s.addr, res->ai_addr, sizeof(sockaddr_in));
     freeaddrinfo(res);
   }
   return true;
 }
-namespace {
-vector<int> erase_list;
-std::unordered_map<int, std::unique_ptr<Session>> sessions;
-} // namespace
-
 class Timer {
 private:
   Socket tfd;
@@ -69,238 +64,253 @@ public:
     ts.it_interval.tv_sec = sec_interval;
     timerfd_settime(tfd.get(), 0, &ts, nullptr);
   }
-  Socket get_socket() { return move(tfd); }
+  Socket get_socket() { return std::move(tfd); }
 };
 
-optional<Socket> create_tcp_upstream() {
-  optional<TCPserver> upstream;
+int get_socket_error(int fd) {
+  int err = 0;
+  socklen_t len = sizeof(err);
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+    return errno;
+  }
+  return err;
+}
+
+struct UpstreamConnection {
+  Socket socket;
+  Server *server{nullptr};
+};
+
+std::optional<UpstreamConnection> create_tcp_upstream() {
+  std::optional<TCPserver> upstream;
   while (true) {
     auto active_server =
         server_list | std::views::filter(&Server::active_server);
-    auto it = ranges::min_element(active_server, {}, &Server::active_connect);
-    if (it == ranges::end(active_server)) {
-      cout << "Доступных серверов нет" << endl;
-      return nullopt;
+    auto it =
+        std::ranges::min_element(active_server, {}, &Server::active_connect);
+    if (it == std::ranges::end(active_server)) {
+      std::cout << "There are no available servers." << std::endl;
+      return std::nullopt;
     }
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) {
-      return nullopt;
+      return std::nullopt;
     }
     Socket upstream_sock(fd);
-    // it->addr уже лежит в памяти, никакой задержки:
     int res = connect(fd, reinterpret_cast<struct sockaddr *>(&it->addr),
                       sizeof(it->addr));
 
     if (res < 0 && errno != EINPROGRESS) {
-      cerr << "Не удалось создать tcp upstream";
+      std::cerr << "Failed to create tcp upstream";
       it->error_count++;
       if (it->error_count >= 2) {
-        cout << "Сервер " + it->server_ip
-             << " перестал выходить на связь. Отключаю" << endl;
+        std::cout << "Server " + it->server_ip
+                  << " stopped communicating. Disconnecting." << std::endl;
+
         it->active_server = false;
+        inactive_server.push_back(*it);
       }
       continue;
     }
-    return upstream_sock;
     it->active_connect++;
-    break;
+    return UpstreamConnection{.socket = std::move(upstream_sock),
+                              .server = &(*it)};
   }
 }
 
-void handle_read_event(Connection *conn, EpollManage &epoll) {
-  auto [request, status] = recvall(conn->socket.get());
-  if (!request.empty() && conn->peer) {
-    conn->peer->out_buffer += request;
-    cout << "Записано " << conn->peer->out_buffer << endl;
-    epoll.epoll_enable_write(conn->peer);
+void close_slot(ConnectionSlot &slot, EpollManage &epoll) noexcept {
+  if (slot.socket.get() == -1) {
+    return;
   }
-  if (status == Status::Disconect || status == Status::Error) {
-    cout << "Отключаю" << conn->socket.get() << endl;
-    auto client_fd = conn->socket.get();
-    if (conn->peer) {
-      conn->peer->close_on_empty = true;
-      conn->peer->peer = nullptr;
+  epoll.epoll_remove(&slot);
+  if (slot.peer != nullptr) {
+    if (slot.peer->peer == &slot) {
+      slot.peer->peer = nullptr;
     }
-    epoll.epoll_remove(conn);
-    conn->socket = Socket(-1);
-    if (sessions.contains(client_fd))
-      erase_list.push_back(client_fd);
+    slot.peer = nullptr;
   }
-}
+  if (slot.type == SlotType::UPSTREAM && slot.server != nullptr) {
+    if (slot.server->active_connect > 0) {
+      slot.server->active_connect--;
+    }
+    slot.server = nullptr;
+  }
 
-void handle_write_event(Connection *conn, EpollManage &epoll) {
-  auto status = sendall(conn->socket.get(), conn->out_buffer);
+  slot.socket = Socket(-1);
+
+  slot.type = SlotType::UNUSED;
+  slot.state = ConnState::IDLE;
+  slot.out_buffer.clear();
+  slot.generation++;
+}
+Status handle_read_event(ConnectionSlot *slot, EpollManage &epoll) {
+  auto [request, status] = recvall(slot->socket.get());
+  if (!request.empty() && slot->peer != nullptr) {
+    slot->peer->out_buffer += request;
+    //  cout << "Записано " << slot->peer->out_buffer << endl;
+    epoll.epoll_enable_write(slot->peer);
+  }
   if (status == Status::Error) {
-    cerr << "sendall error: " << strerror(errno) << endl;
+    std::cout << "Отключаю" << slot->socket.get() << std::endl;
+    if (slot->type == SlotType::UPSTREAM && slot->server) {
+      slot->server->error_count++;
+    }
+    auto *peer = slot->peer;
+    close_slot(*slot, epoll);
+    if (peer) {
+      close_slot(*peer, epoll);
+    }
+    return status;
   }
-  if (conn->out_buffer.empty()) {
-    cout << "Отправил" << endl;
-    epoll.epoll_disable_write(conn);
+  if (status == Status::Disconect) {
+    if (slot->type == SlotType::CLIENT) {
+      auto *peer = slot->peer;
+      close_slot(*slot, epoll);
+      if (peer) {
+        close_slot(*peer, epoll);
+      }
+    }
+    if (slot->type == SlotType::UPSTREAM) {
+      auto *peer = slot->peer;
+      close_slot(*slot, epoll);
 
-    if (conn->close_on_empty) {
-      auto fd = conn->socket.get();
-      epoll.epoll_remove(conn);
-      conn->socket = Socket(-1);
-      if (sessions.contains(fd))
-        erase_list.push_back(fd);
+      if (peer) {
+        peer->peer = nullptr;
+        if (peer->out_buffer.empty()) {
+          close_slot(*peer, epoll);
+        } else {
+          peer->state = ConnState::DRAINING;
+          epoll.epoll_enable_write(peer);
+        }
+      }
     }
   }
+  return status;
 }
 
-void handle_accept_socket(Connection *conn, EpollManage &epoll) {
+Status handle_write_event(ConnectionSlot *slot, EpollManage &epoll) {
+  auto status = sendall(slot->socket.get(), slot->out_buffer);
+  if (status == Status::Error) {
+    std::cerr << "sendall error: " << strerror(errno) << std::endl;
+    close_slot(*slot, epoll);
+    return status;
+  }
+  if (slot->out_buffer.empty()) {
+    epoll.epoll_disable_write(slot);
+  }
+  return status;
+}
+void handle_accept_socket(EpollManage &epoll, ConnectionSlot *slot,
+                          ConectionPool &pool) {
   while (true) {
-    auto [client, status] = accept_fd(conn->socket.get(), true);
+    auto [client, status] = accept_fd(slot->socket.get(), true);
     if (status != Status::Ok) {
       if (status == Status::Eagain) {
         break;
-      } else {
-        cerr << "accept_fd error: " << strerror(errno) << endl;
       }
+      std::cerr << "accept_fd error: " << strerror(errno) << std::endl;
       break;
     }
-    auto client_fd = client.get();
-
     auto upstream = create_tcp_upstream();
     if (!upstream) {
-      break;
+      std::string err_503 =
+          "HTTP/1.1 503 Service Unavailable\r\nContent-Length: "
+          "0\r\nConnection: close\r\n\r\n";
+      ::send(client.get(), err_503.data(), err_503.size(), MSG_NOSIGNAL);
+      break; // client закроется деструктором ~Socket()
     }
-    cout << "upstream " << upstream->get() << endl;
-    auto session = std::make_unique<Session>();
-    session->client.socket = std::move(client);
-    session->upstream.socket = std::move(*upstream);
 
-    epoll.epoll_add_read(&session->client);
-    epoll.epoll_add_read(&session->upstream);
-    cout << "client_fd " << client_fd << endl;
-    sessions[client_fd] = move(session);
-    cout << client_fd << endl;
+    auto [cl_slot, up_slot] = pool.create_tunnel(
+        std::move(client), std::move(upstream->socket), upstream->server);
+
+    epoll.epoll_add_read(&cl_slot);
+    epoll.epoll_add_read(&up_slot);
   }
 }
 
-void handle_timer_alarm(Connection *conn) {
+void handle_timer_alarm(ConnectionSlot *slot) {
   uint64_t expirations = 0;
-  read(conn->socket.get(), &expirations, sizeof(expirations));
-  auto inactive_server = server_list | std::views::filter([](const auto &s) {
-                           return !s.active_server;
-                         });
+  read(slot->socket.get(), &expirations, sizeof(expirations));
   for (auto &s : inactive_server) {
     if (auto upstream = TCPserver::create_tcp(s.server_ip.c_str(), BACKEND_PORT,
                                               SocketMode::Connector, true)) {
       s.active_server = true;
+      std::cout << "Server " << s.server_ip << "return to life" << std::endl;
     }
   }
 }
 
-void clear_dead_socket() {
-
-  for (int key : erase_list) {
-    sessions.erase(key);
-  }
-  erase_list.clear();
-}
-
-void event_loop(TCPserver &server, EpollManage &epoll) {
+void event_loop(ConnectionSlot &lis_slot, EpollManage &epoll,
+                ConectionPool &pool) {
   int ep_fd = epoll.epoll_create();
   auto ep_ev = epoll.epoll_ev;
 
-  Connection lis_conn{.socket = server.get_socket(),
-                      .peer = nullptr}; // Структура для прнимающего сервера
-  epoll.epoll_add_read(&lis_conn);
+  epoll.epoll_add_read(&lis_slot);
 
   auto tfd = Timer(2, 2);
-  Connection timer_conn{.socket = tfd.get_socket(), .peer = nullptr};
-  epoll.epoll_add_read(&timer_conn);
+  auto &tfd_slot = pool.create_slot(tfd.get_socket(), SlotType::TIMER);
+  epoll.epoll_add_read(&tfd_slot);
 
   while (true) {
     int nfds = epoll_wait(ep_fd, ep_ev, 65, -1);
     if (nfds == -1) {
       if (errno == EINTR)
         continue;
-      cerr << "epoll_wait error: " << strerror(errno) << endl;
+      std::cerr << "epoll_wait error: " << strerror(errno) << std::endl;
       break;
     }
 
     for (int i = 0; i < nfds; i++) {
-      auto *conn = static_cast<Connection *>(ep_ev[i].data.ptr);
+      auto slot = static_cast<ConnectionSlot *>(ep_ev[i].data.ptr);
       uint32_t revents = ep_ev[i].events;
-      if (conn->socket.get() == -1) {
+      if (slot->socket.get() == -1 || slot->state == ConnState::IDLE) {
         continue;
       }
 
-      if (conn == &timer_conn) {
-        uint64_t expirations = 0;
-        read(conn->socket.get(), &expirations, sizeof(expirations));
-        auto inactive_server =
-            server_list |
-            std::views::filter([](const auto &s) { return !s.active_server; });
-        for (auto &s : inactive_server) {
-          if (auto upstream = TCPserver::create_tcp(
-                  s.server_ip.c_str(), "3491", SocketMode::Connector, true)) {
-            s.active_server = true;
-            s.error_count = 0;
-          }
-        }
-
+      if (slot->type == SlotType::TIMER) {
+        handle_timer_alarm(slot);
+        continue;
+      }
+      if (slot->type == SlotType::LISTENER) {
+        handle_accept_socket(epoll, slot, pool);
         continue;
       }
 
-      if (conn == &listener_conn) {
-        while (true) {
-          auto [client, status] = accept_fd(conn->socket.get(), true);
-          if (status != Status::Ok) {
-            if (status == Status::Eagain) {
-              break;
-            } else {
-              cerr << "accept_fd error: " << strerror(errno) << endl;
-            }
-            break;
-          }
-          auto client_fd = client.get();
-
-          auto upstream = create_tcp_upstream();
-          if (!upstream) {
-            std::string err_resp =
-                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: "
-                "0\r\nConnection: close\r\n\r\n";
-            send(client.get(), err_resp.data(), err_resp.size(), 0);
-            break;
-          }
-          cout << "upstream " << upstream->get() << endl;
-          auto session = std::make_unique<Session>();
-          session->client.socket = std::move(client);
-          session->upstream.socket = std::move(*upstream);
-
-          epoll.epoll_add_read(&session->client);
-          epoll.epoll_add_read(&session->upstream);
-          cout << "client_fd " << client_fd << endl;
-          sessions[client_fd] = move(session);
-          cout << client_fd << endl;
-        }
-        handle_timer_alarm(conn);
-        continue;
-      }
-      if (conn == &lis_conn) {
-        handle_accept_socket(conn, epoll);
+      if (revents & (EPOLLERR | EPOLLHUP)) {
+        close_slot(*slot, epoll);
         continue;
       }
       if (revents & EPOLLIN) {
-        handle_read_event(conn, epoll);
+        handle_read_event(slot, epoll);
       }
-      if (revents & EPOLLOUT) {
-        handle_write_event(conn, epoll);
+      if (slot->socket.get() != -1 && (revents & EPOLLOUT)) {
+        handle_write_event(slot, epoll);
       }
     }
-    clear_dead_socket();
   }
 }
 
 int main() {
-  if (auto server = TCPserver::create_tcp(NULL, CLIENT_PORT,
-                                          SocketMode::Listener, true)) {
+  signal(SIGPIPE, SIG_IGN);
+  if (!init_server_addresses()) {
+    std::cerr << "The servers did not initialize." << std::endl;
+    return 1;
+  }
 
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+    throw std::system_error(errno, std::generic_category(), "getrlimit failed");
+  }
+
+  ConectionPool connections(rl.rlim_cur);
+
+  if (auto listener = TCPserver::create_tcp(NULL, CLIENT_PORT,
+                                            SocketMode::Listener, true)) {
+    auto &lis_slot =
+        connections.create_slot(listener->get_socket(), SlotType::LISTENER);
     EpollManage epoll;
-    cout << "Начинаю цикл" << endl;
-    event_loop(*server, epoll);
+    std::cout << "Starting a cycle" << std::endl;
+    event_loop(lis_slot, epoll, connections);
   } else {
     return 1;
   }
